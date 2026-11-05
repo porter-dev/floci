@@ -4,10 +4,12 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsProxyServer;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RequestHost;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.WebSocketUpgrades;
 import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -42,6 +44,7 @@ import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
 import io.vertx.core.net.PemKeyCertOptions;
+import io.vertx.core.net.SocketAddress;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -698,7 +701,10 @@ public class ElbV2DataPlane {
                 .filter(candidate -> candidate != null && "forward".equals(candidate.getType()))
                 .findFirst().orElse(null);
         String tgArn = action == null ? null : resolveTgArn(action);
-        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroup(listener.region(), tgArn);
+        // A raw connection has no request scope, and ELBv2 state is stored per account.
+        String accountId = AwsArnUtils.accountOrDefault(listener.arn(), null);
+        TargetGroup tg = tgArn == null ? null : RequestScopes.callAs(accountId, listener.region(),
+                () -> elbV2Service.getTargetGroup(listener.region(), tgArn));
         if (tg == null || "lambda".equals(tg.getTargetType())) {
             socket.close();
             return;
@@ -711,6 +717,8 @@ public class ElbV2DataPlane {
         TargetDescription target = pickRoundRobin(tgArn, candidates);
         int port = ElbV2HealthChecker.effectivePort(target, tg);
         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        boolean proxyProtocol = tg.getAttributes() != null
+                && Boolean.parseBoolean(tg.getAttributes().get(PROXY_PROTOCOL_V2_ATTRIBUTE));
         AtomicBoolean disconnected = new AtomicBoolean();
         socket.closeHandler(ignored -> disconnected.set(true));
         vertx.executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
@@ -721,7 +729,11 @@ public class ElbV2DataPlane {
                         upstream.close();
                         return;
                     }
-                    long idleTimeoutMillis = tcpIdleTimeoutMillis(listener.arn(), listener.region());
+                    long idleTimeoutMillis = RequestScopes.callAs(accountId, listener.region(),
+                            () -> tcpIdleTimeoutMillis(listener.arn(), listener.region()));
+                    if (proxyProtocol) {
+                        upstream.write(proxyProtocolV2Header(socket.remoteAddress(), socket.localAddress()));
+                    }
                     tunnel(socket, upstream, idleTimeoutMillis);
                     socket.resume();
                 })
@@ -729,6 +741,50 @@ public class ElbV2DataPlane {
                     LOG.debugv("ELBv2 TCP connection to {0}:{1} failed: {2}", host, port, err.getMessage());
                     socket.close();
                 });
+    }
+
+    private static final String PROXY_PROTOCOL_V2_ATTRIBUTE = "proxy_protocol_v2.enabled";
+    private static final byte[] PROXY_V2_SIGNATURE = {
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A};
+
+    /** NLB listeners pass TCP, TLS and TCP_UDP bytes to the target unchanged, so all three use the TCP relay. */
+    static boolean isTcpPassthrough(String protocol) {
+        return "TCP".equalsIgnoreCase(protocol) || "TLS".equalsIgnoreCase(protocol)
+                || "TCP_UDP".equalsIgnoreCase(protocol);
+    }
+
+    /** Builds a PROXY protocol v2 header for a TCP over IPv4 connection, as an NLB sends it. */
+    static Buffer proxyProtocolV2Header(SocketAddress source, SocketAddress destination) {
+        Buffer header = Buffer.buffer().appendBytes(PROXY_V2_SIGNATURE);
+        byte[] src = ipv4Bytes(source.hostAddress());
+        byte[] dst = ipv4Bytes(destination.hostAddress());
+        if (src == null || dst == null) {
+            // The LOCAL command tells the receiver to use the addresses of the connection.
+            return header.appendByte((byte) 0x20).appendByte((byte) 0x00).appendShort((short) 0);
+        }
+        return header.appendByte((byte) 0x21)   // version 2, PROXY command
+                .appendByte((byte) 0x11)        // TCP over IPv4
+                .appendShort((short) 12)
+                .appendBytes(src)
+                .appendBytes(dst)
+                .appendShort((short) source.port())
+                .appendShort((short) destination.port());
+    }
+
+    private static byte[] ipv4Bytes(String address) {
+        if (address == null) {
+            return null;
+        }
+        String plain = address.startsWith("::ffff:") ? address.substring(7) : address;
+        String[] parts = plain.split("\\.");
+        if (parts.length != 4) {
+            return null;
+        }
+        byte[] bytes = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            bytes[i] = (byte) Integer.parseInt(parts[i]);
+        }
+        return bytes;
     }
 
     private void closePortServerIfUnused(int port, Map<String, String> listenersByHost) {
@@ -832,7 +888,7 @@ public class ElbV2DataPlane {
             }
         }
         return new ListenerBinding(listener.getPort(), host, listener.getLoadBalancerArn(),
-                secure, Set.copyOf(hosts), List.copyOf(certificates), "TCP".equalsIgnoreCase(listener.getProtocol()));
+                secure, Set.copyOf(hosts), List.copyOf(certificates), isTcpPassthrough(listener.getProtocol()));
     }
 
     public void requireCompatibleListenerProtocol(String listenerArn, int port, String protocol) {
@@ -840,7 +896,7 @@ public class ElbV2DataPlane {
             return;
         }
         onPort(port, state -> {
-            requireCompatiblePort(port, "HTTPS".equalsIgnoreCase(protocol), "TCP".equalsIgnoreCase(protocol), listenerArn);
+            requireCompatiblePort(port, "HTTPS".equalsIgnoreCase(protocol), isTcpPassthrough(protocol), listenerArn);
             return null;
         });
     }

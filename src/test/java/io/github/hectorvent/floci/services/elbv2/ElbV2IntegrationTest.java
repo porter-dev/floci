@@ -191,6 +191,22 @@ class ElbV2IntegrationTest {
     @Test
     @Order(4)
     void duplicateLoadBalancerNameThrows() {
+        // AWS only rejects a repeated name when the settings differ.
+        given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "my-test-lb")
+                .formParam("Type", "network")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("DuplicateLoadBalancerName"));
+    }
+
+    @Test
+    @Order(4)
+    void repeatedCreateWithSameSettingsReturnsExistingLoadBalancer() {
         given()
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "my-test-lb")
@@ -200,8 +216,9 @@ class ElbV2IntegrationTest {
             .when()
                 .post("/")
             .then()
-                .statusCode(400)
-                .body("ErrorResponse.Error.Code", equalTo("DuplicateLoadBalancerName"));
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn",
+                        equalTo(lbArn));
     }
 
     @Test
