@@ -229,6 +229,11 @@ public class TlsConfigSource implements ConfigSource {
         return "true".equalsIgnoreCase(resolveProperty("floci.dns.spoof-aws-endpoints", "false"));
     }
 
+    /** Whether {@code floci.services.eks.worker-nodes} is set where this source can read it. */
+    static boolean eksWorkerNodesVisibleToTls() {
+        return "true".equalsIgnoreCase(resolveProperty("floci.services.eks.worker-nodes", "false"));
+    }
+
     /** Whether {@code floci.tls.enabled} is set where this source can read it. */
     public static boolean tlsEnabledVisibleToTls() {
         return "true".equalsIgnoreCase(resolveProperty("floci.tls.enabled", "false"));
@@ -313,7 +318,8 @@ public class TlsConfigSource implements ConfigSource {
      * and are not intercepted, so they get no SAN.
      */
     private List<String> awsSpoofSans() {
-        if (!spoofAwsEndpointsVisibleToTls()) {
+        // EKS worker-node pods reach Floci under real AWS hostnames through cluster DNS.
+        if (!spoofAwsEndpointsVisibleToTls() && !eksWorkerNodesVisibleToTls()) {
             return List.of();
         }
         List<String> sans = new ArrayList<>();
