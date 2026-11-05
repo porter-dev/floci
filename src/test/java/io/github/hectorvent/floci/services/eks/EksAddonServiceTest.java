@@ -103,6 +103,25 @@ class EksAddonServiceTest {
     }
 
     @Test
+    void createAcceptsAnEksBuildTheCatalogDoesNotList() {
+        Fixture fixture = fixture();
+        fixture.cluster.setVersion("1.35");
+        CreateAddonRequest request = new CreateAddonRequest(
+                "vpc-cni",
+                "v1.99.0-eksbuild.1",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null
+        );
+
+        Addon created = fixture.service.create(fixture.cluster, request);
+        assertEquals("v1.99.0-eksbuild.1", created.addonVersion());
+    }
+
+    @Test
     void createRejectsUnknownAddonAndUnsupportedVersion() {
         Fixture fixture = fixture();
 

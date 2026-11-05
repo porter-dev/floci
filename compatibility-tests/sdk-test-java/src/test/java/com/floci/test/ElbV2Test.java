@@ -195,7 +195,7 @@ class ElbV2Test {
 
     @Test
     @Order(4)
-    @DisplayName("CreateLoadBalancer - duplicate name throws DuplicateLoadBalancerNameException")
+    @DisplayName("CreateLoadBalancer - duplicate name with other settings throws DuplicateLoadBalancerNameException")
     void createLoadBalancerDuplicateName() {
         // A create that repeats the existing balancer's settings succeeds on AWS, so this one differs in
         // its scheme; it names subnets so the taken name is the only thing wrong with it.

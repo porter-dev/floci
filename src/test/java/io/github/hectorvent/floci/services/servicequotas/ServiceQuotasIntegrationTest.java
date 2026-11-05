@@ -218,7 +218,7 @@ class ServiceQuotasIntegrationTest {
             .then().log().ifValidationFails().statusCode(200)
                 .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.QuotaName", equalTo(name))
                 .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.Value", equalTo(5.0f))
-                .body("Quotas.size()", equalTo(4));
+                .body("Quotas.size()", equalTo(12));
         }
     }
 
@@ -566,7 +566,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4))
+            .body("Quotas.size()", equalTo(12))
             .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.QuotaAppliedAtLevel", equalTo("ACCOUNT"));
     }
 
@@ -582,7 +582,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4));
+            .body("Quotas.size()", equalTo(12));
     }
 
     @Test
@@ -598,7 +598,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4));
+            .body("Quotas.size()", equalTo(12));
     }
 
     @Test

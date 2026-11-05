@@ -4283,6 +4283,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             for (Instance inst : launched) {
+                if (launchAsEksNode(inst, region)) {
+                    continue;
+                }
                 List<SecurityGroup> policyGroups = inst.getSecurityGroups().stream()
                         .map(group -> securityGroups.get(key(region, group.getGroupId()))
                                 .orElseThrow(() -> new IllegalStateException("Missing security group " + group.getGroupId())))
@@ -4297,6 +4300,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
 
         return reservation;
+    }
+
+    @Inject
+    jakarta.enterprise.inject.Instance<EksNodeLauncher> eksNodeLaunchers;
+
+    private boolean launchAsEksNode(Instance inst, String region) {
+        if (eksNodeLaunchers == null || eksNodeLaunchers.isUnsatisfied()) {
+            return false;
+        }
+        for (EksNodeLauncher launcher : eksNodeLaunchers) {
+            if (launcher.launchWorkerNode(inst, region)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

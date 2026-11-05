@@ -178,6 +178,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
         if (!config.services().eks().mock()) {
             restorePersistedClusters();
+            if (clusterManager != null) {
+                Thread.ofVirtual().name("eks-aws-api-gateway").start(clusterManager::startAwsApiGateway);
+            }
         } else {
             restoreMockJoinedInstances();
         }
@@ -225,7 +228,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 LOG.infov("Restoring k3s container for persisted EKS cluster {0}", cluster.getName());
                 cluster.setStatus(ClusterStatus.CREATING);
                 cluster.setPodCidr(EksClusterManager.DEFAULT_POD_CIDR);
-                if (cluster.getNodeInstanceType() == null) {
+                // Worker node containers carry node group capacity, so the server keeps its size.
+                if (cluster.getNodeInstanceType() == null && !config.services().eks().workerNodes()) {
                     firstNodeGroup(cluster.getName(), entry.accountId()).ifPresent(group ->
                             cluster.setNodeInstanceType(selectedNodeInstanceType(group)));
                 }
@@ -792,6 +796,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     @Override
     public void onInstanceLaunched(String accountId, String region, Instance instance) {
+        if (instance != null && clusterManager != null && clusterManager.claimWorkerLaunchedInstance(instance.getInstanceId())) {
+            return;
+        }
         extractInstanceClusterName(instance).ifPresent(name ->
                 RequestScopes.runAs(accountId, region, () -> {
                     try {
@@ -975,8 +982,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         nodeGroup.setModifiedAt(now);
         String resolvedVersion = request.getVersion() != null ? request.getVersion() : cluster.getVersion();
         nodeGroup.setVersion(resolvedVersion);
-        nodeGroup.setReleaseVersion(request.getReleaseVersion() != null
-                ? request.getReleaseVersion() : resolvedVersion + "-eks-1");
+        // EKS reports a launch template's custom AMI ID as the release version.
+        String templateAmi = launchTemplateData != null ? launchTemplateData.getImageId() : null;
+        nodeGroup.setReleaseVersion(request.getReleaseVersion() != null ? request.getReleaseVersion()
+                : templateAmi != null && !templateAmi.isBlank() ? templateAmi : resolvedVersion + "-eks-1");
         nodeGroup.setStatus(NodegroupStatus.ACTIVE);
         nodeGroup.setCapacityType(request.getCapacityType() != null ? request.getCapacityType() : "ON_DEMAND");
         nodeGroup.setScalingConfig(request.getScalingConfig() != null ? request.getScalingConfig() : defaultScalingConfig());
@@ -1000,7 +1009,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
         String capacityKey = accountId + "/" + clusterName;
         Object capacityLock = capacityLock(accountId, clusterName);
-        boolean hasUserData = launchTemplateData != null && launchTemplateData.getUserData() != null
+        boolean workerNodes = clusterManager != null && clusterManager.workerNodesEnabled();
+        // With worker nodes, the node group gets its own nodes and leaves the server alone.
+        boolean hasUserData = !workerNodes && launchTemplateData != null && launchTemplateData.getUserData() != null
                 && !launchTemplateData.getUserData().isBlank();
         Cluster currentCluster;
         CompletableFuture<Boolean> pendingFirst;
@@ -1013,7 +1024,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             currentCluster = describeCluster(clusterName);
             pendingFirst = pendingFirstNodeGroups.get(capacityKey);
             boolean firstGroup = firstNodeGroup(clusterName, accountId).isEmpty() && pendingFirst == null;
-            if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
+            if (workerNodes) {
+                // Worker node containers carry the capacity; the server keeps its size.
+            } else if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
                 applyFirstNodeGroupCapacity(clusterName, nodegroupName, currentCluster, nodeGroup);
                 if (currentCluster.getContainerId() != null && currentCluster.getStatus() == ClusterStatus.ACTIVE) {
                     LOG.infov("EKS cluster {0} is already running; nodegroup {1} node labels and taints are not applied to the running node",
@@ -1078,7 +1091,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 if (nodeGroupStorage.get(storageKey)
                         .filter(saved -> arn.equals(saved.getNodegroupArn())).isPresent()) {
                     if (nodeGroup.getStatus() == NodegroupStatus.CREATING) {
-                        if (!ownsPendingFirst && firstNodeGroup(clusterName, accountId).isEmpty()
+                        if (!ownsPendingFirst && !workerNodes && firstNodeGroup(clusterName, accountId).isEmpty()
                                 && !config.services().eks().mock() && clusterManager != null) {
                             Cluster refreshedCluster = describeCluster(clusterName);
                             applyFirstNodeGroupCapacity(clusterName, nodegroupName, refreshedCluster, nodeGroup);
@@ -1097,7 +1110,66 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }
             }
         }
+        if (workerNodes && nodeGroup.getStatus() == NodegroupStatus.ACTIVE) {
+            startNodegroupWorkers(describeCluster(clusterName), nodeGroup, region);
+        }
         return nodeGroup;
+    }
+
+    /**
+     * Starts the node group's worker nodes, one per desired node up to the configured cap. The
+     * nodes spread over the node group's subnets, as EKS spreads them over availability zones.
+     */
+    private void startNodegroupWorkers(Cluster cluster, Nodegroup nodeGroup, String region) {
+        int desired = nodeGroup.getScalingConfig() != null && nodeGroup.getScalingConfig().getDesiredSize() != null
+                ? nodeGroup.getScalingConfig().getDesiredSize() : 1;
+        int count = Math.max(0, Math.min(desired, config.services().eks().maxNodesPerNodegroup()));
+        Map<String, String> labels = new LinkedHashMap<>();
+        if (nodeGroup.getLabels() != null) {
+            labels.putAll(nodeGroup.getLabels());
+        }
+        labels.put(EksClusterManager.NODEGROUP_LABEL, nodeGroup.getNodegroupName());
+        labels.put("eks.amazonaws.com/capacityType", nodeGroup.getCapacityType()); // partition-literal: a Kubernetes label key
+        if (nodeGroup.getReleaseVersion() != null) {
+            labels.put("eks.amazonaws.com/nodegroup-image", nodeGroup.getReleaseVersion()); // partition-literal: a Kubernetes label key
+        }
+        List<String> taints = kubeletTaints(nodeGroup.getTaints());
+        String instanceType = nodeGroup.getInstanceTypes() == null || nodeGroup.getInstanceTypes().isEmpty()
+                ? null : nodeGroup.getInstanceTypes().getFirst();
+        List<String> subnets = nodeGroup.getSubnets() == null ? List.of() : nodeGroup.getSubnets();
+        for (int i = 0; i < count; i++) {
+            String subnetId = subnets.isEmpty() ? null : subnets.get(i % subnets.size());
+            String az = subnetId != null ? ec2Service.requireSubnet(region, subnetId).getAvailabilityZone() : region + "a";
+            String instanceId = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
+            try {
+                clusterManager.startWorkerNode(cluster, new EksClusterManager.WorkerNodeSpec(
+                        instanceId, az, instanceType, subnetId, labels, taints), true);
+            } catch (RuntimeException e) {
+                LOG.warnv("Node group {0} could not start worker node {1}: {2}",
+                        nodeGroup.getNodegroupName(), instanceId, e.getMessage());
+            }
+        }
+    }
+
+    /** Converts EKS taints ({@code NO_SCHEDULE}) to the kubelet form ({@code key=value:NoSchedule}). */
+    static List<String> kubeletTaints(List<Object> taints) {
+        List<String> result = new ArrayList<>();
+        if (taints == null) {
+            return result;
+        }
+        for (Object taint : taints) {
+            if (!(taint instanceof Map<?, ?> map) || map.get("key") == null) {
+                continue;
+            }
+            String effect = switch (String.valueOf(map.get("effect"))) {
+                case "NO_EXECUTE" -> "NoExecute";
+                case "PREFER_NO_SCHEDULE" -> "PreferNoSchedule";
+                default -> "NoSchedule";
+            };
+            Object value = map.get("value");
+            result.add(map.get("key") + (value != null ? "=" + value : "") + ":" + effect);
+        }
+        return result;
     }
 
     private void applyFirstNodeGroupCapacity(String clusterName, String nodegroupName,
@@ -1196,6 +1268,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
         synchronized (capacityLock) {
             Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
+            if (clusterManager != null && clusterManager.workerNodesEnabled()) {
+                clusterManager.stopNodegroupWorkers(describeCluster(clusterName), nodegroupName);
+            }
             nodeGroup.setStatus(NodegroupStatus.DELETING);
             nodeGroup.setModifiedAt(Instant.now());
             nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));

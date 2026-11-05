@@ -206,6 +206,7 @@ public class ResourceArnBuilder {
             case "kinesis"        -> List.of(buildKinesisArn(ctx, region, accountId));
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "ec2"            -> List.of(buildEc2Arn(ctx, region, accountId));
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
@@ -219,6 +220,73 @@ public class ResourceArnBuilder {
             case "bedrock"        -> List.of(buildBedrockArn(path, ctx));
             default               -> namedResources(credentialScope, operation, ctx, region, accountId, partition);
         };
+    }
+
+    // ── EC2 ─────────────────────────────────────────────────────────────────────
+    // Scoped EC2 policies name a resource type, such as launch-template/* or instance/*.
+
+    private static final Map<String, String> EC2_ACTION_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("CreateLaunchTemplate", "launch-template"),
+            Map.entry("CreateLaunchTemplateVersion", "launch-template"),
+            Map.entry("ModifyLaunchTemplate", "launch-template"),
+            Map.entry("DeleteLaunchTemplate", "launch-template"),
+            Map.entry("CreateFleet", "fleet"),
+            Map.entry("RunInstances", "instance"),
+            Map.entry("TerminateInstances", "instance"),
+            Map.entry("StartInstances", "instance"),
+            Map.entry("StopInstances", "instance"),
+            Map.entry("RebootInstances", "instance"),
+            Map.entry("CreateVolume", "volume"),
+            Map.entry("DeleteVolume", "volume"),
+            Map.entry("AttachVolume", "volume"),
+            Map.entry("DetachVolume", "volume"),
+            Map.entry("ModifyVolume", "volume"),
+            Map.entry("CreateSnapshot", "snapshot"),
+            Map.entry("DeleteSnapshot", "snapshot"));
+
+    private static final Map<String, String> EC2_ID_PREFIX_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("i-", "instance"),
+            Map.entry("lt-", "launch-template"),
+            Map.entry("fleet-", "fleet"),
+            Map.entry("vol-", "volume"),
+            Map.entry("snap-", "snapshot"),
+            Map.entry("sg-", "security-group"),
+            Map.entry("subnet-", "subnet"),
+            Map.entry("vpc-", "vpc"),
+            Map.entry("eni-", "network-interface"),
+            Map.entry("rtb-", "route-table"),
+            Map.entry("igw-", "internet-gateway"),
+            Map.entry("nat-", "natgateway"),
+            Map.entry("eipalloc-", "elastic-ip"));
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = RequestBodyReader.formField(ctx, "Action");
+        if (action == null) {
+            return "*";
+        }
+        String type = EC2_ACTION_RESOURCE_TYPES.get(action);
+        boolean tagging = "CreateTags".equals(action) || "DeleteTags".equals(action);
+        String id = tagging ? RequestBodyReader.formField(ctx, "ResourceId.1")
+                : firstNonEmpty(ctx, "InstanceId.1", "LaunchTemplateId", "VolumeId", "SnapshotId");
+        if (type == null && tagging && id != null) {
+            type = EC2_ID_PREFIX_RESOURCE_TYPES.entrySet().stream()
+                    .filter(e -> id.startsWith(e.getKey())).map(Map.Entry::getValue).findFirst().orElse(null);
+        }
+        if (type == null) {
+            return "*";
+        }
+        String name = id == null || id.isEmpty() || action.startsWith("Create") && !tagging ? "*" : id;
+        return AwsArnUtils.Arn.of("ec2", region, accountId, type + "/" + name).toString();
+    }
+
+    private static String firstNonEmpty(ContainerRequestContext ctx, String... keys) {
+        for (String key : keys) {
+            String value = RequestBodyReader.formField(ctx, key);
+            if (value != null && !value.isEmpty()) {
+                return value;
+            }
+        }
+        return null;
     }
 
     /**

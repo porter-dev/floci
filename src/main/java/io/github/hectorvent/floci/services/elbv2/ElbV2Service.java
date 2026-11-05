@@ -7,13 +7,16 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -33,6 +36,7 @@ import java.util.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -88,6 +92,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+    private Supplier<Set<String>> listenerAccounts = Set::of;
 
     @PostConstruct
     void initializeStorage()
@@ -99,8 +104,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
         this.targetGroups = storageBacked("elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
-        this.listeners = storageBacked("elbv2-listeners.json",
-                new TypeReference<Map<String, Map<String, Listener>>>() {});
+        StorageBackend<String, Map<String, Listener>> listenerStore =
+                storageFactory.create("elbv2", "elbv2-listeners.json",
+                        new TypeReference<Map<String, Map<String, Listener>>>() {});
+        this.listenerAccounts = () -> listenerStore instanceof AccountAwareStorageBackend<Map<String, Listener>> aware
+                ? aware.scanAllAccountEntries(key -> true).stream()
+                        .map(AccountAwareStorageBackend.AccountEntry::accountId).collect(Collectors.toSet())
+                : Set.of();
+        this.listeners = new StorageBackedMap<>(listenerStore);
         this.rules = storageBacked("elbv2-rules.json",
                 new TypeReference<Map<String, Map<String, Rule>>>() {});
         this.tags = storageBacked("elbv2-tags.json",
@@ -185,6 +196,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      */
     public void restorePersistedRuntime()
     {
+        // Storage is scoped to the request's account, so each account restores under its own scope.
+        Set<String> accounts = new LinkedHashSet<>(listenerAccounts.get());
+        accounts.add(regionResolver.getAccountId());
+        for (String accountId : accounts) {
+            RequestScopes.callAs(accountId, () -> {
+                restorePersistedRuntimeForAccount();
+                return null;
+            });
+        }
+    }
+
+    private void restorePersistedRuntimeForAccount()
+    {
         refreshCanonicalHostedZones();
         if (healthChecker != null) {
             for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
@@ -249,15 +273,20 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                                            Map<String, String> initialTags) {
         validateName(name, "load balancer");
         Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        boolean duplicate = regionLbs.values().stream()
-                .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
-        if (duplicate) {
+        String lbType = type != null ? type : "application";
+        String lbScheme = scheme != null ? scheme : "internet-facing";
+        Optional<LoadBalancer> existing = regionLbs.values().stream()
+                .filter(lb -> lb.getLoadBalancerName().equals(name)).findFirst();
+        if (existing.isPresent()) {
+            // AWS returns the existing load balancer when a create repeats its name and settings.
+            if (lbType.equals(existing.get().getType()) && lbScheme.equals(existing.get().getScheme())
+                    && sameSubnets(existing.get(), subnets)) {
+                return existing.get();
+            }
             throw new AwsException("DuplicateLoadBalancerName",
                     "A load balancer with name '" + name + "' already exists.", 400);
         }
 
-        String lbType = type != null ? type : "application";
-        String lbScheme = scheme != null ? scheme : "internet-facing";
         String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();
@@ -304,6 +333,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
      * message and order.
      */
+    private static boolean sameSubnets(LoadBalancer lb, List<String> subnets) {
+        Set<String> current = lb.getAvailabilityZones() == null ? Set.of() : lb.getAvailabilityZones().stream()
+                .map(AvailabilityZone::getSubnetId).filter(Objects::nonNull).collect(Collectors.toSet());
+        return current.equals(subnets == null ? Set.of() : Set.copyOf(subnets));
+    }
+
     private static void requireSubnets(String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
         if ("application".equals(lbType) && count < 2) {

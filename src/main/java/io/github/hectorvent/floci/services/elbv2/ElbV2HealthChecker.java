@@ -19,7 +19,9 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.net.Proxy;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.security.GeneralSecurityException;
@@ -175,6 +177,9 @@ public class ElbV2HealthChecker implements Resettable {
             int healthyThreshold = tg.getHealthyThresholdCount() != null ? tg.getHealthyThresholdCount() : 5;
             int unhealthyThreshold = tg.getUnhealthyThresholdCount() != null ? tg.getUnhealthyThresholdCount() : 2;
             int probePort = healthCheckPort(tg, port);
+            boolean tcpCheck = "TCP".equalsIgnoreCase(protocol);
+            boolean proxyProtocol = tg.getAttributes() != null
+                    && Boolean.parseBoolean(tg.getAttributes().get("proxy_protocol_v2.enabled"));
 
             synchronized (state) {
                 if (state.inFlight || state.workerRunning) {
@@ -193,7 +198,8 @@ public class ElbV2HealthChecker implements Resettable {
                     }
                     return SocketDeadline.call(timeout, () -> {
                         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, targetId);
-                        return probeOnce(host, probePort, path, timeout, protocol);
+                        return tcpCheck ? probeTcp(host, probePort, timeout, proxyProtocol)
+                                : probeOnce(host, probePort, path, timeout, protocol);
                     }, () -> {
                         synchronized (state) {
                             state.workerRunning = false;
@@ -223,7 +229,7 @@ public class ElbV2HealthChecker implements Resettable {
                                         targetId, port, outcome.cause().getMessage());
                             } else if (outcome.result() != null) {
                                 int statusCode = outcome.result();
-                                if (matchesStatusCode(statusCode, matcher)) {
+                                if (tcpCheck || matchesStatusCode(statusCode, matcher)) {
                                     state.consecutiveFailures = 0;
                                     state.consecutiveSuccesses++;
                                     boolean initialApplicationTarget = "initial".equals(state.status)
@@ -258,6 +264,23 @@ public class ElbV2HealthChecker implements Resettable {
                 }
                 throw error;
             }
+        }
+    }
+
+    // An NLB health check sends a LOCAL PROXY v2 header, or the target logs a broken header.
+    private static final byte[] PROXY_V2_LOCAL_HEADER = {
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20, 0x00, 0x00, 0x00};
+
+    /** A TCP health check passes when the connection opens. It reports a 200 so it shares the result path. */
+    private int probeTcp(String host, int port, int timeoutSeconds, boolean proxyProtocol) throws IOException {
+        try (Socket socket = new Socket(Proxy.NO_PROXY)) {
+            socket.connect(new InetSocketAddress(ElbV2TargetResolver.resolveCheckedAddress(host), port),
+                    timeoutSeconds * 1000);
+            if (proxyProtocol) {
+                socket.getOutputStream().write(PROXY_V2_LOCAL_HEADER);
+                socket.getOutputStream().flush();
+            }
+            return 200;
         }
     }
 
