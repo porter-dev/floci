@@ -4903,18 +4903,30 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
     }
 
-    /** IMDS registrations are rebuilt on startup; discard credentials from the previous server. */
+    /** Removes expired IMDS credentials; live ones stay valid for guests that cached them before a restart. */
     public int sweepOrphanedEc2InstanceSessions() {
-        List<SessionCredential> stored = sessions instanceof AccountAwareStorageBackend<SessionCredential> aware
-                ? aware.scanAllAccounts() : sessions.scan(key -> true);
+        Instant now = Instant.now();
         int removed = 0;
-        for (SessionCredential session : stored) {
-            if (session.getEc2InstanceId() != null) {
+        for (SessionCredential session : allSessions()) {
+            if (session.getEc2InstanceId() != null && !session.getExpiration().isAfter(now)) {
                 deleteSession(session.getAccessKeyId(), session);
                 removed++;
             }
         }
         return removed;
+    }
+
+    /** Returns the stored IMDS credentials of one instance, oldest expiration first. */
+    public List<SessionCredential> findEc2InstanceSessions(String instanceId) {
+        return allSessions().stream()
+                .filter(session -> instanceId.equals(session.getEc2InstanceId()))
+                .sorted(Comparator.comparing(SessionCredential::getExpiration))
+                .toList();
+    }
+
+    private List<SessionCredential> allSessions() {
+        return sessions instanceof AccountAwareStorageBackend<SessionCredential> aware
+                ? aware.scanAllAccounts() : sessions.scan(key -> true);
     }
 
     /** Registers an ECS task-role session, outside request scope. */
