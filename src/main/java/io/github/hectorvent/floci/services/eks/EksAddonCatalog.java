@@ -14,12 +14,14 @@ import java.io.InputStream;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class EksAddonCatalog {
 
     private static final Logger LOG = Logger.getLogger(EksAddonCatalog.class);
     private static final String CATALOG_RESOURCE_NAME = "eks/addon-versions.json";
+    private static final Pattern EKS_BUILD_VERSION = Pattern.compile("v\\d+\\.\\d+\\.\\d+-eksbuild\\.\\d+");
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private volatile List<AddonInfo> addons;
@@ -101,12 +103,18 @@ public class EksAddonCatalog {
         }
         String k8s = kubernetesVersion != null && isClusterVersionInCatalog(kubernetesVersion)
                 ? normalizeK8sVersion(kubernetesVersion) : null;
-        return findAddon(addonName)
-                .map(AddonInfo::addonVersions)
-                .orElse(List.of())
-                .stream()
+        Optional<AddonInfo> addon = findAddon(addonName);
+        if (addon.isEmpty()) {
+            return false;
+        }
+        List<AddonVersionInfo> listed = addon.get().addonVersions().stream()
                 .filter(v -> v.addonVersion().equalsIgnoreCase(addonVersion.trim()))
-                .anyMatch(v -> k8s == null || isCompatible(v, k8s, false));
+                .toList();
+        if (listed.isEmpty()) {
+            // AWS publishes new addon builds often, so accept any real EKS build the catalog does not list yet.
+            return EKS_BUILD_VERSION.matcher(addonVersion.trim()).matches();
+        }
+        return listed.stream().anyMatch(v -> k8s == null || isCompatible(v, k8s, false));
     }
 
     public Optional<String> resolveDefaultVersion(String addonName, String kubernetesVersion) {

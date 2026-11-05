@@ -40,6 +40,7 @@ ADDONS = [
     "eks-pod-identity-agent",
     "aws-ebs-csi-driver",
     "amazon-cloudwatch-observability",
+    "aws-efs-csi-driver",
 ]
 # Each field the catalog keeps and the JSON type Java reads it as; STRINGS is a list of strings.
 STRINGS = "list of strings"
