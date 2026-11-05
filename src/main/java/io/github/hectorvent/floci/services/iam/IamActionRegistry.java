@@ -641,7 +641,7 @@ public class IamActionRegistry {
         if (isQueryRequest(ctx)) {
             String queryAction = queryAction(ctx);
             if (queryAction != null && !queryAction.isBlank()) {
-                return IamAuthorizedActions.actionFor(credentialScope, queryAction);
+                return IamAuthorizedActions.actionFor(iamPrefix(credentialScope), queryAction);
             }
         }
 
@@ -669,7 +669,7 @@ public class IamActionRegistry {
                 return statementAction;
             }
         }
-        return IamAuthorizedActions.actionFor(credentialScope, operationName);
+        return IamAuthorizedActions.actionFor(iamPrefix(credentialScope), operationName);
     }
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
@@ -1069,4 +1069,15 @@ public class IamActionRegistry {
         return name != null && !name.isEmpty() ? "s3:GetObjectAnnotation" : "s3:ListObjectAnnotations";
     }
 
+    /** The IAM namespace for a SigV4 signing name. Some services sign under a name that differs from their IAM prefix. */
+    public static String iamPrefix(String signingName) {
+        if (signingName == null) {
+            return null;
+        }
+        return switch (signingName) {
+            case "tagging" -> "tag";
+            case "email" -> "ses";
+            default -> signingName;
+        };
+    }
 }

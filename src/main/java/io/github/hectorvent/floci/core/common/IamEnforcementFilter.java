@@ -833,7 +833,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     .map(descriptor -> iamServiceScope(descriptor, claimedScope))
                     .orElseGet(() -> catalog.canonicalCredentialScope(service));
             return new ResolvedAuthorization(servingScope,
-                    IamAuthorizedActions.actionFor(servingScope, queryAction), servingScope + ":" + queryAction);
+                    IamAuthorizedActions.actionFor(IamActionRegistry.iamPrefix(servingScope), queryAction),
+                    servingScope + ":" + queryAction);
         }
 
         // Read from the route rather than the claim: a path the claim filter takes for RPC v2 can

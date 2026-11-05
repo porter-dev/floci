@@ -883,6 +883,29 @@ class ResourceArnBuilderTest {
     }
 
 
+    // ── EC2 ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    void ec2CreateNamesEveryResourceOfTheType() {
+        setFormBody("Action=CreateLaunchTemplate&LaunchTemplateName=nodes");
+        assertEquals("arn:aws:ec2:us-east-1:000000000000:launch-template/*",
+                builder.build("ec2", ctx, "us-east-1", "000000000000"));
+    }
+
+    @Test
+    void ec2NamesTheInstanceTheRequestActsOn() {
+        setFormBody("Action=TerminateInstances&InstanceId.1=i-0123456789abcdef0");
+        assertEquals("arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
+                builder.build("ec2", ctx, "us-east-1", "000000000000"));
+    }
+
+    @Test
+    void ec2CreateTagsTakesTheTypeFromTheResourceIdPrefix() {
+        setFormBody("Action=CreateTags&ResourceId.1=vol-0123456789abcdef0&Tag.1.Key=k&Tag.1.Value=v");
+        assertEquals("arn:aws:ec2:us-east-1:000000000000:volume/vol-0123456789abcdef0",
+                builder.build("ec2", ctx, "us-east-1", "000000000000"));
+    }
+
     // ── DynamoDB ─────────────────────────────────────────────────────────────────
 
     @Test
